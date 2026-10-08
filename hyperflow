@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# hyperflow — native push-to-talk dictation for Hyprland.
+# No daemon, no shim: Hyprland owns the keybind, this runs per press.
+#
+#   hyperflow start     begin recording (waybar icon → REC)
+#   hyperflow stop      transcribe + type at cursor
+#   hyperflow toggle    tap-to-talk alternative
+#   hyperflow cancel    drop the recording, transcribe nothing
+#   hyperflow status    print current waybar status JSON
+#
+# Config: ~/.config/hyperflow/env  (chmod 600)
+#   AZURE_STT_ENDPOINT=https://<your-resource>.cognitiveservices.azure.com
+#   AZURE_SPEECH_KEY=<your key>
+#   AZURE_STT_LOCALES=en-US,hi-IN        (comma-separated auto-detect candidates)
+#
+# Shell env vars of the same names override the file.
+set -u
+
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/hyperflow"
+RUN="${XDG_RUNTIME_DIR:-/run/user/$UID}/hyperflow"
+WAV="$RUN/recording.wav"
+PIDF="$RUN/recorder.pid"
+STATUS="$CACHE/status.json"
+ASSETS="$HOME/.local/share/hyperflow/assets"
+CFG="$HOME/.config/hyperflow/env"
+API_VER="2025-10-15"
+MIN_SECONDS="0.6"
+
+mkdir -p "$CACHE" "$RUN"
+
+# env vars win; config file is the fallback
+if [ -z "${AZURE_STT_ENDPOINT:-}" ] && [ -f "$CFG" ]; then
+    # shellcheck disable=SC1090
+    . "$CFG"
+fi
+EP="${AZURE_STT_ENDPOINT:-}"
+KEY="${AZURE_SPEECH_KEY:-${AZURE_OPENAI_API_KEY:-}}"
+LOCALE_CANDIDATES="${AZURE_STT_LOCALES:-en-US,hi-IN}"
+
+fail_config() {
+    notify-send "hyperflow" "$1" 2>/dev/null
+    echo "hyperflow: $1" >&2
+    exit 1
+}
+
+status() { # $1 class, $2 text, $3 tooltip
+    printf '{"text":"%s","tooltip":"%s","class":"%s","alt":"%s"}\n' "$2" "$3" "$1" "$1" > "$STATUS"
+}
+
+sound() {
+    [ -f "$ASSETS/$1" ] && pw-play --volume=0.35 "$ASSETS/$1" >/dev/null 2>&1 &
+    return 0
+}
+
+idle() { status inactive "󰍭" "Ready"; }
+
+cmd="${1:-toggle}"
+case "$cmd" in
+start)
+    [ -z "$EP" ] && fail_config "set AZURE_STT_ENDPOINT in $CFG"
+    [ -z "$KEY" ] && fail_config "set AZURE_SPEECH_KEY in $CFG"
+    if [ -s "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; then exit 0; fi
+    : > "$WAV"
+    arecord -q -f S16_LE -r 16000 -c 1 "$WAV" 2>/dev/null &
+    echo $! > "$PIDF"
+    status active "󰍬" "Recording..."
+    sound ping-up.ogg
+    ;;
+stop)
+    [ -s "$PIDF" ] || exit 0
+    pid="$(cat "$PIDF")"; rm -f "$PIDF"
+    kill -INT "$pid" 2>/dev/null; sleep 0.1
+    kill -0 "$pid" 2>/dev/null && { sleep 0.3; kill -9 "$pid" 2>/dev/null; }
+    wait "$pid" 2>/dev/null
+    status processing "󰔟" "Transcribing..."
+    sound ping-down.ogg
+
+    dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$WAV" 2>/dev/null || echo 0)
+    if awk -v d="${dur:-0}" -v m="$MIN_SECONDS" 'BEGIN{exit !((d+0)<m)}'; then
+        notify-send "hyperflow" "Hold a bit longer — nothing captured" 2>/dev/null
+        idle; exit 0
+    fi
+
+    defn=$(AZURE_STT_LOCALES="$LOCALE_CANDIDATES" python3 -c "import json,os
+print(json.dumps({'languageIdentification': {'candidateLocales': os.environ['AZURE_STT_LOCALES'].split(',')}}))" 2>/dev/null)
+    [ -z "$defn" ] && defn="{\"locales\":[\"en-US\"]}"
+
+    resp=$(curl -sS --max-time 45 -X POST \
+        "${EP%/}/speechtotext/transcriptions:transcribe?api-version=$API_VER" \
+        -H "Ocp-Apim-Subscription-Key: $KEY" \
+        -F "audio=@$WAV;type=audio/wav" \
+        -F "definition=$defn" 2>/dev/null) || resp=''
+
+    text=$(printf '%s' "$resp" | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+parts = [p.get("text", "") for p in d.get("combinedPhrases") or []]
+t = " ".join(x for x in parts if x).strip()
+if not t:
+    t = " ".join(p.get("text", "") for p in d.get("phrases") or []).strip()
+print(t)')
+
+    if [ -z "$text" ]; then
+        notify-send "hyperflow" "No speech detected" 2>/dev/null
+        idle; exit 0
+    fi
+
+    printf '%s' "$text" | wl-copy
+
+    if [ "${HYPERFLOW_NO_PASTE:-0}" = "1" ]; then
+        idle; exit 0   # debug mode: clipboard only
+    fi
+
+    class=$(hyprctl activewindow -j 2>/dev/null | python3 -c 'import sys,json
+try: print(json.load(sys.stdin).get("class", ""))
+except Exception: print("")')
+    sleep 0.15
+    case "$class" in
+        *ghostty*|*kitty*|*alacritty*|*wezterm*|*Terminal*)
+            hyprctl dispatch sendshortcut "CTRL SHIFT, V, activewindow" >/dev/null 2>&1 \
+                || wtype -M ctrl -M shift -k v -m shift -m ctrl ;;
+        *)
+            hyprctl dispatch sendshortcut "CTRL, V, activewindow" >/dev/null 2>&1 \
+                || wtype -M ctrl -k v -m ctrl ;;
+    esac
+    idle
+    ;;
+toggle)
+    if [ -s "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; then
+        exec "$0" stop
+    else
+        exec "$0" start
+    fi
+    ;;
+cancel)
+    [ -s "$PIDF" ] && { kill -INT "$(cat "$PIDF")" 2>/dev/null; rm -f "$PIDF"; }
+    idle
+    ;;
+status)
+    [ -f "$STATUS" ] || idle
+    cat "$STATUS"
+    ;;
+*)
+    echo "usage: hyperflow start|stop|toggle|cancel|status" >&2
+    exit 1
+    ;;
+esac

@@ -1,0 +1,18 @@
+/* hyperflow waybar indicator — plain colored text, no pill, no blink */
+#custom-hyperflow {
+    padding: 0 10px;
+    opacity: 0.55;
+    transition: color 0.2s ease, opacity 0.2s ease;
+}
+#custom-hyperflow.active {
+    color: #f38ba8;   /* red REC while recording */
+    opacity: 1;
+}
+#custom-hyperflow.processing {
+    color: #f9e2af;   /* amber while transcribing */
+    opacity: 1;
+}
+#custom-hyperflow.error {
+    color: #f38ba8;
+    opacity: 1;
+}

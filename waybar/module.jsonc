@@ -1,0 +1,17 @@
+{
+    // paste inside your waybar modules file
+    "custom/hyperflow": {
+        "exec": "cat ${XDG_CACHE_HOME:-$HOME/.cache}/hyperflow/status.json 2>/dev/null || echo '{\"text\":\"\U000f0359\",\"class\":\"inactive\",\"tooltip\":\"Not running\"}'",
+        "return-type": "json",
+        "format": " {icon} ",
+        "format-icons": {
+            "inactive": "\U000f0359",
+            "active": "\U000f035c REC",
+            "processing": "\U000f051f \u2026"
+        },
+        "interval": 1,
+        "tooltip": true
+    }
+}
+
+// then add "custom/hyperflow" to one of your bar's modules-left/center/right arrays
